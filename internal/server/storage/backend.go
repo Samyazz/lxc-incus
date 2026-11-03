@@ -4570,15 +4570,15 @@ func (b *backend) ensureImage(l logger.Logger, fingerprint string, op *operation
 			}
 
 			imgVol.SetConfigSize(newVolSize)
+			hinted := b.applyImageSizeHint(l, imgVol, image)
 
 			// Try applying the current size policy to the existing volume. If it is the same the
 			// driver should make no changes, and if not then attempt to resize it to the new policy.
 			l.Debug("Setting image volume size", logger.Ctx{"size": imgVol.ConfigSize()})
 			err = b.driver.SetVolumeQuota(imgVol, imgVol.ConfigSize(), false, op)
-			if errors.Is(err, drivers.ErrCannotBeShrunk) || errors.Is(err, drivers.ErrNotSupported) {
-				// If the driver cannot resize the existing image volume to the new policy size
-				// then delete the image volume and try to recreate using the new policy settings.
-				l.Debug("Volume size of pool has changed since cached image volume created and cached volume cannot be resized, regenerating image volume")
+			if errors.Is(err, drivers.ErrCannotBeShrunk) || errors.Is(err, drivers.ErrNotSupported) || (err != nil && hinted) {
+				// If the existing image volume can't be resized to the new size, regenerate it.
+				l.Debug("Cached image volume cannot be resized to the current size policy, regenerating image volume", logger.Ctx{"err": err})
 				err = b.DeleteImage(fingerprint, op)
 				if err != nil {
 					return false, err
@@ -4660,7 +4660,11 @@ func (b *backend) ensureImage(l logger.Logger, fingerprint string, op *operation
 		_ = b.state.Authorizer.DeleteStoragePoolVolume(b.state.ShutdownCtx, api.ProjectDefaultName, b.Name(), drivers.VolumeTypeImage.Singular(), fingerprint, location)
 	})
 
-	err = b.driver.CreateVolume(imgVol, &volFiller, op)
+	// Apply the image's size hint, it isn't stored so it's re-evaluated each time the image volume is used.
+	newImgVol := imgVol.Clone()
+	b.applyImageSizeHint(l, newImgVol, image)
+
+	err = b.driver.CreateVolume(newImgVol, &volFiller, op)
 	if err != nil {
 		return false, err
 	}
@@ -4681,6 +4685,33 @@ func (b *backend) ensureImage(l logger.Logger, fingerprint string, op *operation
 
 	reverter.Success()
 	return false, nil
+}
+
+// applyImageSizeHint sets the size of a block backed container image volume from the image's size hint
+// property, if present and smaller than the size from the volume's current config. Invalid hints are ignored.
+// Returns true if the volume's size was changed.
+func (b *backend) applyImageSizeHint(l logger.Logger, imgVol drivers.Volume, image *api.Image) bool {
+	// gendoc:generate(entity=image, group=volume, key=volume.size_hint)
+	// Size needed to unpack a container image. On block backed storage pools, it is used as the size of
+	// the cached image volume when it is smaller than the pool's `volume.size` (or the default size).
+	// It is ignored if invalid or smaller than the image file itself, and doesn't affect instance volume sizes.
+	// ---
+	//  type: string
+	//  shortdesc: Size of the cached image volume for container images on block backed storage pools
+	size, err := imgVol.ConfigSizeFromHint(image.Properties["volume.size_hint"], image.Size)
+	if err != nil {
+		l.Warn("Ignoring invalid image size hint", logger.Ctx{"err": err})
+		return false
+	}
+
+	if size == imgVol.ConfigSize() {
+		return false
+	}
+
+	l.Debug("Using image size hint for image volume", logger.Ctx{"size": size})
+	imgVol.SetConfigSize(size)
+
+	return true
 }
 
 // shouldUseOptimizedImage determines if an optimized image should be used based on the provided volume config.
